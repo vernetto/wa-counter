@@ -14,8 +14,10 @@
 // first non-empty text span in the header otherwise.
 //
 // To avoid re-counting the same message when its checkmark status changes
-// (single -> double -> blue), each msg-meta element is marked exactly once
-// with the data-wa-counter-seen attribute directly in the DOM.
+// (single -> double -> blue) — which causes WhatsApp to replace the msg-meta
+// DOM node entirely — each message is identified by a content-derived key
+// (timestamp + text, or chat + visible time as fallback) tracked in memory,
+// rather than by tagging the DOM node itself.
 //
 // On startup, the chat history already visible on the page is "marked as seen"
 // but NOT counted (otherwise every WhatsApp Web reload would recount the whole
@@ -23,7 +25,6 @@
 
 (function () {
   const STORAGE_PREFIX = "wa_count_";
-  const PROCESSED_ATTR = "data-wa-counter-seen";
 
   // Set to true to log debug info in the console (message detection + recipient
   // name detection) — useful if WhatsApp changes its DOM structure again.
@@ -100,6 +101,38 @@
 
   // ---------- Message detection ----------
 
+  // In-memory set of message keys already processed. Using a content-derived
+  // key (instead of tagging the DOM node) is essential: WhatsApp replaces the
+  // msg-meta node entirely as delivery status changes (pending -> sent ->
+  // delivered -> read), so a node-level "seen" flag would be lost each time
+  // and the same message would get counted again for every status change.
+  const seenMessageKeys = new Set();
+
+  function getMessageKey(metaEl) {
+    // Preferred: climb up to find the nearby copyable-text element, which
+    // carries data-pre-plain-text (sender + minute-precision timestamp) plus
+    // the message text — stable even when the meta node is re-rendered.
+    let node = metaEl;
+    for (let i = 0; i < 8 && node; i++) {
+      node = node.parentElement;
+      if (!node) break;
+      const ct = node.querySelector('.copyable-text[data-pre-plain-text]');
+      if (ct) {
+        const pre = ct.getAttribute("data-pre-plain-text") || "";
+        const text = (ct.textContent || "").trim();
+        return `text|${pre}|${text}`;
+      }
+      if (node.getAttribute && node.getAttribute("role") === "row") break;
+    }
+    // Fallback for messages without copyable-text (media, voice notes, etc.):
+    // chat name + the visible timestamp text. Less precise (could collide if
+    // two such messages land in the same minute in the same chat) but avoids
+    // the far worse problem of systematic over-counting.
+    const chat = getCurrentChatName() || "";
+    const timeText = (metaEl.textContent || "").trim();
+    return `meta|${chat}|${timeText}`;
+  }
+
   function isOutgoingMetaEl(metaEl) {
     const titles = metaEl.querySelectorAll("svg title");
     for (const t of titles) {
@@ -109,8 +142,9 @@
   }
 
   function processMetaEl(metaEl, baseline) {
-    if (metaEl.hasAttribute(PROCESSED_ATTR)) return;
-    metaEl.setAttribute(PROCESSED_ATTR, "1");
+    const key = getMessageKey(metaEl);
+    if (seenMessageKeys.has(key)) return;
+    seenMessageKeys.add(key);
 
     const outgoing = isOutgoingMetaEl(metaEl);
 
@@ -118,8 +152,8 @@
       console.log("[WA Counter][DEBUG] msg-meta found", {
         baseline,
         outgoing,
+        key,
         chatName: getCurrentChatName(),
-        outerHTML: metaEl.outerHTML.slice(0, 300),
       });
     }
 
