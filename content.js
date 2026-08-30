@@ -147,17 +147,24 @@
     seenMessageKeys.add(key);
 
     const outgoing = isOutgoingMetaEl(metaEl);
+    const inChatSwitchGrace = Date.now() < chatSwitchGraceUntil;
+    const treatAsBaseline = baseline || inChatSwitchGrace;
 
     if (window.__WA_COUNTER_DEBUG__) {
       console.log("[WA Counter][DEBUG] msg-meta found", {
         baseline,
+        inChatSwitchGrace,
         outgoing,
         key,
         chatName: getCurrentChatName(),
       });
     }
 
-    if (baseline) return; // don't count history already present at startup
+    // Don't count: startup history, or history mounted right after switching
+    // to a different chat (WhatsApp inserts the whole visible chat log as
+    // "new" DOM nodes when you open a chat, which would otherwise look like
+    // messages just sent).
+    if (treatAsBaseline) return;
     if (outgoing) {
       incrementTodayCount();
       recordRecipientStat(getCurrentChatName(), todayDateStr());
@@ -176,7 +183,24 @@
     }
   }
 
+  // Detects when the open chat changes (by watching the header title) and
+  // opens a short grace window during which newly-mounted messages are
+  // treated as history, not live sends. Without this, switching to a chat
+  // whose most recent message(s) you sent would incorrectly bump today's count.
+  const CHAT_SWITCH_GRACE_MS = 1500;
+  let lastChatName = null;
+  let chatSwitchGraceUntil = 0;
+
+  function noteChatContext() {
+    const current = getCurrentChatName();
+    if (current !== lastChatName) {
+      lastChatName = current;
+      chatSwitchGraceUntil = Date.now() + CHAT_SWITCH_GRACE_MS;
+    }
+  }
+
   const observer = new MutationObserver((mutations) => {
+    noteChatContext();
     for (const m of mutations) {
       m.addedNodes.forEach((n) => scanNode(n, false));
     }
@@ -206,8 +230,10 @@
         display: "flex",
         alignItems: "center",
         gap: "6px",
+        cursor: "grab",
       });
-      el.title = "Messages sent today on WhatsApp Web (right-click to hide)";
+      el.title =
+        "Messages sent today on WhatsApp Web — drag to move, right-click to hide, double-click to reset position";
 
       const label = document.createElement("span");
       label.id = "wa-counter-overlay-label";
@@ -218,7 +244,67 @@
         el.style.display = "none";
       });
 
+      // ---- Dragging ----
+      let dragging = false;
+      let offsetX = 0;
+      let offsetY = 0;
+      let moved = false;
+
+      el.addEventListener("mousedown", (e) => {
+        dragging = true;
+        moved = false;
+        const rect = el.getBoundingClientRect();
+        offsetX = e.clientX - rect.left;
+        offsetY = e.clientY - rect.top;
+        el.style.cursor = "grabbing";
+        e.preventDefault();
+      });
+
+      document.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        moved = true;
+        let x = e.clientX - offsetX;
+        let y = e.clientY - offsetY;
+        // Keep it within the viewport
+        x = Math.max(0, Math.min(window.innerWidth - el.offsetWidth, x));
+        y = Math.max(0, Math.min(window.innerHeight - el.offsetHeight, y));
+        el.style.left = `${x}px`;
+        el.style.top = `${y}px`;
+        el.style.right = "auto";
+        el.style.bottom = "auto";
+      });
+
+      document.addEventListener("mouseup", () => {
+        if (!dragging) return;
+        dragging = false;
+        el.style.cursor = "grab";
+        if (moved) {
+          const rect = el.getBoundingClientRect();
+          chrome.storage.local.set({
+            overlayPosition: { top: rect.top, left: rect.left },
+          });
+        }
+      });
+
+      el.addEventListener("dblclick", () => {
+        el.style.top = "";
+        el.style.left = "";
+        el.style.bottom = "16px";
+        el.style.right = "16px";
+        chrome.storage.local.remove("overlayPosition");
+      });
+
       document.body.appendChild(el);
+
+      // Restore any previously saved position
+      chrome.storage.local.get("overlayPosition", (res) => {
+        if (res.overlayPosition) {
+          el.style.top = `${res.overlayPosition.top}px`;
+          el.style.left = `${res.overlayPosition.left}px`;
+          el.style.right = "auto";
+          el.style.bottom = "auto";
+        }
+      });
     }
     return el;
   }
@@ -245,6 +331,7 @@
   });
 
   function start() {
+    lastChatName = getCurrentChatName();
     scanNode(document.body, true);
     observer.observe(document.body, { childList: true, subtree: true });
     refreshOverlayFromStorage();
